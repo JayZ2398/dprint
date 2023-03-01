@@ -153,16 +153,21 @@ pub fn gen_separated_values(
   let multi_line_options = opts.multi_line_options;
   let mut is_start_standalone_line = get_is_start_standalone_line(start_cn, start_lscn);
   let is_start_standalone_line_ref = is_start_standalone_line.create_reference();
+  let is_start_standalone_line_reevaluation = is_start_standalone_line.create_reevaluation();
   let mut is_multi_line_condition = {
     if opts.force_use_new_lines {
+      println!("multi line true");
       Condition::new_true()
     } else if opts.prefer_hanging {
       if !multi_line_options.newline_at_start {
+        println!("multi line false");
         Condition::new_false()
       } else {
+        println!("multi line for hanging preference");
         get_is_multi_line_for_hanging(value_datas.clone(), is_start_standalone_line_ref)
       }
     } else {
+      println!("multi line for multi line preference");
       get_is_multi_line_for_multi_line(start_ln, value_datas.clone(), is_start_standalone_line_ref, end_ln)
     }
   };
@@ -191,12 +196,7 @@ pub fn gen_separated_values(
   );
   value_datas.borrow_mut().extend(inner_gen_result.value_datas);
   let generated_values_items = inner_gen_result.items.into_rc_path();
-  items.push_condition(Condition::new(
-    "multiLineOrHanging",
-    ConditionProperties {
-      condition: is_multi_line,
-      true_path: Some(
-        if_true_or(
+  let mut new_line_indented_if_not_standalone = if_true_or(
           "newLineIndentedIfNotStandalone",
           Rc::new(move |context| Some(!context.resolved_condition(&is_start_standalone_line_ref)?)),
           {
@@ -217,7 +217,14 @@ pub fn gen_separated_values(
             items
           },
           generated_values_items.into(),
-        )
+        );
+  let new_line_indented_if_not_standalone_reevalation = new_line_indented_if_not_standalone.create_reevaluation();
+  let mut multi_line_or_hanging = Condition::new(
+    "multiLineOrHanging",
+    ConditionProperties {
+      condition: is_multi_line,
+      true_path: Some(
+        new_line_indented_if_not_standalone
         .into(),
       ),
       false_path: Some({
@@ -245,10 +252,14 @@ pub fn gen_separated_values(
         items
       }),
     },
-  ));
-
+  );
+  let multi_line_or_hanging_reevaluation = multi_line_or_hanging.create_reevaluation();
+  items.push_condition(multi_line_or_hanging);
   items.push_info(end_ln);
+  items.push_reevaluation(is_start_standalone_line_reevaluation);
   items.push_reevaluation(is_multi_line_reevaluation);
+  items.push_reevaluation(new_line_indented_if_not_standalone_reevalation);
+  items.push_reevaluation(multi_line_or_hanging_reevaluation);
 
   return GenSeparatedValuesResult {
     items,
@@ -509,7 +520,7 @@ fn get_is_multi_line_for_multi_line(
     "isMultiLineForMultiLine",
     ConditionProperties {
       condition: Rc::new(move |condition_context| {
-        let result = evaluate(start_ln, &value_datas, &is_start_standalone_line_ref, end_ln, condition_context);
+        let result = should_make_node_multi_line(start_ln, &value_datas, &is_start_standalone_line_ref, end_ln, condition_context).unwrap_or(false);
         let mut last_result = last_result.borrow_mut();
         // If the last result was ever true and this result is `Some(false)`,
         // that means something trailing on the last line is causing it the
@@ -518,18 +529,33 @@ fn get_is_multi_line_for_multi_line(
         // that the start position hasn't changed since it's not `None` where
         // the infos have been cleared on position change.
         // See https://github.com/dprint/dprint-plugin-typescript/issues/372 for more details
-        if *last_result && matches!(result, Some(false)) {
+        if *last_result && !result {
+          println!("A isMultiLineForMultiLine near start_ln {}: {}", start_ln.name(), true);
           return Some(true);
         }
-        *last_result = result.unwrap_or(false);
-        result
+        *last_result = result;
+        println!("B isMultiLineForMultiLine near start_ln {}: {}", start_ln.name(), result);
+        Some(result)
       }),
       false_path: None,
       true_path: None,
     },
   );
 
-  fn evaluate(
+  /// Returns true if a particular parent node should be formatted in multi-line mode based on its child value nodes.
+  /// 
+  /// # Arguments
+  /// * `start_ln` - The starting line of the node.
+  /// * `end_ln` - The ending line of the node.
+  /// * `value_datas` - An array of information pertaining to the node's contents. For example, this is used to describe the formatting preferences of the nodes contained as values within an ArrayLit node.
+  /// * `is_start_standalone_line_ref` - A condition that resolves to true if the printer is on a standalone (blank) line.
+  /// 
+  /// # Behaviour
+  /// Returns `true` if any of the following are true:
+  /// 1. Any value is on the start of a line.
+  /// 2. Any value is multi-line and doesn't allow the parent to be inline.
+  /// 3. Any value is single-line and doesn't allow the parent to be inline.
+  fn should_make_node_multi_line(
     start_ln: LineNumber,
     value_datas: &Rc<RefCell<Vec<GeneratedValueData>>>,
     is_start_standalone_line_ref: &ConditionReference,
@@ -541,8 +567,8 @@ fn get_is_multi_line_for_multi_line(
     let start_ln = condition_context.resolved_line_number(start_ln)?;
     let end_ln = condition_context.resolved_line_number(end_ln)?;
     let mut last_ln = start_ln;
-    let mut last_allows_multi_line = true;
-    let mut last_allows_single_line = false;
+    let mut last_value_allows_inline_parent_for_multi_line_value = true;
+    let mut last_value_allows_inline_parent_for_inline_value = false;
     let mut has_multi_line_value = false;
     let value_datas = value_datas.borrow();
 
@@ -555,6 +581,7 @@ fn get_is_multi_line_for_multi_line(
       let value_start_is_start_of_line = condition_context.resolved_is_start_of_line(value_data.is_start_of_line)?;
       // check if any of the value starts are at the beginning of the line
       if value_start_is_start_of_line {
+        println!("true: value is start of line");
         return Some(true);
       }
       let value_start_ln = condition_context.resolved_line_number(value_data.line_number)?;
@@ -566,33 +593,42 @@ fn get_is_multi_line_for_multi_line(
           has_multi_line_value = true;
         }
 
-        if check_value_should_make_multi_line(last_is_multi_line_value, last_allows_multi_line, last_allows_single_line, has_multi_line_value) {
+        if should_child_value_force_parent_to_be_multi_line(
+          last_is_multi_line_value,
+          last_value_allows_inline_parent_for_multi_line_value, 
+          last_value_allows_inline_parent_for_inline_value,
+          has_multi_line_value,
+        ) {
+          println!("true: child forces parent to be multi-line");
           return Some(true);
         }
       }
 
       last_ln = value_start_ln;
-      last_allows_multi_line = value_data.allow_inline_multi_line;
-      last_allows_single_line = value_data.allow_inline_single_line;
+      last_value_allows_inline_parent_for_multi_line_value = value_data.allow_inline_multi_line;
+      last_value_allows_inline_parent_for_inline_value = value_data.allow_inline_single_line;
     }
 
     // check if the last node is single-line
     // todo: consolidate with above
-    let last_is_multi_line_value = last_ln < end_ln;
-    if last_is_multi_line_value {
+    let final_value_is_multi_line = last_ln < end_ln;
+    if final_value_is_multi_line {
       has_multi_line_value = true;
     }
-    Some(check_value_should_make_multi_line(
-      last_is_multi_line_value,
-      last_allows_multi_line,
-      last_allows_single_line,
+    let result = should_child_value_force_parent_to_be_multi_line(
+      final_value_is_multi_line,
+      last_value_allows_inline_parent_for_multi_line_value,
+      last_value_allows_inline_parent_for_inline_value,
       has_multi_line_value,
-    ))
+    );
+    println!("{}: should child force parent to be multi-line", result);
+    Some(result)
   }
 
-  fn check_value_should_make_multi_line(is_multi_line_value: bool, allows_multi_line: bool, allows_single_line: bool, has_multi_line_value: bool) -> bool {
+  // what happens if we set allows_single_line to be allows_inline ? Find out TOMORROW on DPRINT DEBAUCHERY
+  fn should_child_value_force_parent_to_be_multi_line(is_multi_line_value: bool, allows_inline: bool, allows_single_line: bool, has_multi_line_value: bool) -> bool {
     if is_multi_line_value {
-      !allows_multi_line
+      !allows_inline // allows_multi_line is actually value_allows_parent_to_be_inline
     } else {
       has_multi_line_value && !allows_single_line
     }
